@@ -1,0 +1,116 @@
+`timescale 1ns / 1ps
+// -----------------------------------------------------------------------------
+// jrp_board_core.v
+//   Bring-up top for the AXU5EVB-P: jrp_top + sample feeder + clock counter behind ONE AXI4-Lite
+//   slave (for the Vivado JTAG-to-AXI master). Byte address map (base set in the block design):
+//     0x00000  control block (jrp_axi_regs)        0x20000  RQA counters, histograms
+//     0x40000  performance monitor                 0x60000  sample feeder (jrp_sample_feeder)
+//     0x80000  clock counter: 0x0 low word, 0x4 high word of a free-running 64-bit cycle counter
+//   The counter lets the host measure the real clock frequency against wall-clock time.
+// -----------------------------------------------------------------------------
+module jrp_board_core #(
+    parameter integer MAX_M = 6,
+    parameter integer K     = 1     // 1: one pair per cycle, 2: two cells per cycle
+)(
+    (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 clk CLK" *)
+    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axi, ASSOCIATED_RESET rst_n" *)
+    input  wire        clk,
+    (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 rst_n RST" *)
+    (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
+    input  wire        rst_n,
+
+    input  wire [19:0] s_axi_awaddr, input  wire s_axi_awvalid, output wire s_axi_awready,
+    input  wire [31:0] s_axi_wdata,  input  wire [3:0] s_axi_wstrb, input wire s_axi_wvalid, output wire s_axi_wready,
+    output wire [1:0]  s_axi_bresp,  output wire s_axi_bvalid, input wire s_axi_bready,
+    input  wire [19:0] s_axi_araddr, input  wire s_axi_arvalid, output wire s_axi_arready,
+    output wire [31:0] s_axi_rdata,  output wire [1:0] s_axi_rresp, output wire s_axi_rvalid, input wire s_axi_rready
+);
+    // ---- decoder ----
+    wire [16:0]  m_awaddr, m_araddr;
+    wire [31:0]  m_wdata;
+    wire [3:0]   m_wstrb;
+    wire [4:0]   m_awvalid, m_wvalid, m_arvalid, m_bready, m_rready;
+    wire [4:0]   m_awready, m_wready, m_bvalid, m_arready, m_rvalid;
+    wire [9:0]   m_bresp_flat, m_rresp_flat;
+    wire [159:0] m_rdata_flat;
+
+    jrp_axil_decode u_dec (
+        .clk(clk), .rst_n(rst_n),
+        .s_awaddr(s_axi_awaddr), .s_awvalid(s_axi_awvalid), .s_awready(s_axi_awready),
+        .s_wdata(s_axi_wdata), .s_wstrb(s_axi_wstrb), .s_wvalid(s_axi_wvalid), .s_wready(s_axi_wready),
+        .s_bresp(s_axi_bresp), .s_bvalid(s_axi_bvalid), .s_bready(s_axi_bready),
+        .s_araddr(s_axi_araddr), .s_arvalid(s_axi_arvalid), .s_arready(s_axi_arready),
+        .s_rdata(s_axi_rdata), .s_rresp(s_axi_rresp), .s_rvalid(s_axi_rvalid), .s_rready(s_axi_rready),
+        .m_awaddr(m_awaddr), .m_wdata(m_wdata), .m_wstrb(m_wstrb), .m_araddr(m_araddr),
+        .m_awvalid(m_awvalid), .m_wvalid(m_wvalid), .m_arvalid(m_arvalid), .m_bready(m_bready), .m_rready(m_rready),
+        .m_awready(m_awready), .m_wready(m_wready), .m_bvalid(m_bvalid), .m_arready(m_arready), .m_rvalid(m_rvalid),
+        .m_bresp_flat(m_bresp_flat), .m_rdata_flat(m_rdata_flat), .m_rresp_flat(m_rresp_flat));
+
+    // ---- per-target response buses ----
+    wire [1:0]  t_bresp  [0:4];
+    wire [31:0] t_rdata  [0:4];
+    wire [1:0]  t_rresp  [0:4];
+    genvar g;
+    generate for (g = 0; g < 5; g = g + 1) begin : PACK
+        assign m_bresp_flat[g*2 +: 2]  = t_bresp[g];
+        assign m_rresp_flat[g*2 +: 2]  = t_rresp[g];
+        assign m_rdata_flat[g*32 +: 32] = t_rdata[g];
+    end endgenerate
+
+    // ---- target 4: clock counter (read only) ----
+    reg [63:0] cyc;
+    always @(posedge clk or negedge rst_n) if (!rst_n) cyc <= 64'd0; else cyc <= cyc + 1'b1;
+    reg        c_arready, c_rvalid; reg [31:0] c_rdata;
+    reg        c_awready, c_wready, c_bvalid;
+    assign m_arready[4] = c_arready; assign m_rvalid[4] = c_rvalid;
+    assign t_rdata[4] = c_rdata; assign t_rresp[4] = 2'b00;
+    assign m_awready[4] = c_awready; assign m_wready[4] = c_wready; assign m_bvalid[4] = c_bvalid;
+    assign t_bresp[4] = 2'b00;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            c_arready <= 1'b0; c_rvalid <= 1'b0; c_rdata <= 32'd0; c_awready <= 1'b0; c_wready <= 1'b0; c_bvalid <= 1'b0;
+        end else begin
+            c_arready <= (~c_arready) & m_arvalid[4] & ~c_rvalid;
+            if (m_arvalid[4] && c_arready) begin
+                c_rvalid <= 1'b1; c_rdata <= (m_araddr[2] ? cyc[63:32] : cyc[31:0]);
+            end else if (c_rvalid && m_rready[4]) c_rvalid <= 1'b0;
+            // writes to the counter are accepted and ignored
+            c_awready <= (~c_awready) & m_awvalid[4] & m_wvalid[4] & ~c_bvalid;
+            c_wready  <= (~c_wready)  & m_awvalid[4] & m_wvalid[4] & ~c_bvalid;
+            if (m_awvalid[4] && m_wvalid[4] && c_awready && c_wready) c_bvalid <= 1'b1;
+            else if (c_bvalid && m_bready[4]) c_bvalid <= 1'b0;
+        end
+    end
+
+    // ---- sample feeder -> jrp_top ----
+    wire [63:0] samp_tdata; wire samp_tvalid, samp_tready, samp_tlast;
+    jrp_sample_feeder #(.DEPTH(8192)) u_feed (
+        .clk(clk), .rst_n(rst_n),
+        .s_axi_awaddr(m_awaddr[5:0]), .s_axi_awvalid(m_awvalid[3]), .s_axi_awready(m_awready[3]),
+        .s_axi_wdata(m_wdata), .s_axi_wstrb(m_wstrb), .s_axi_wvalid(m_wvalid[3]), .s_axi_wready(m_wready[3]),
+        .s_axi_bresp(t_bresp[3]), .s_axi_bvalid(m_bvalid[3]), .s_axi_bready(m_bready[3]),
+        .s_axi_araddr(m_araddr[5:0]), .s_axi_arvalid(m_arvalid[3]), .s_axi_arready(m_arready[3]),
+        .s_axi_rdata(t_rdata[3]), .s_axi_rresp(t_rresp[3]), .s_axi_rvalid(m_rvalid[3]), .s_axi_rready(m_rready[3]),
+        .m_axis_tdata(samp_tdata), .m_axis_tvalid(samp_tvalid), .m_axis_tready(samp_tready), .m_axis_tlast(samp_tlast));
+
+    // ---- the design under test ----
+    jrp_top #(.DATA_WIDTH(32), .MAX_M(MAX_M), .MAX_TAU(16), .N_MAX(8192), .N_BITS(14), .HIST_W(32), .HIST_K(8192), .K(K)) u_top (
+        .clk(clk), .rst_n(rst_n), .ext_start(1'b0), .frame_busy(), .frame_done_pulse(), .frame_cfg_err(), .n_raw_o(),
+        .s_axi_awaddr(m_awaddr[11:0]), .s_axi_awvalid(m_awvalid[0]), .s_axi_awready(m_awready[0]),
+        .s_axi_wdata(m_wdata), .s_axi_wstrb(m_wstrb), .s_axi_wvalid(m_wvalid[0]), .s_axi_wready(m_wready[0]),
+        .s_axi_bresp(t_bresp[0]), .s_axi_bvalid(m_bvalid[0]), .s_axi_bready(m_bready[0]),
+        .s_axi_araddr(m_araddr[11:0]), .s_axi_arvalid(m_arvalid[0]), .s_axi_arready(m_arready[0]),
+        .s_axi_rdata(t_rdata[0]), .s_axi_rresp(t_rresp[0]), .s_axi_rvalid(m_rvalid[0]), .s_axi_rready(m_rready[0]),
+        .s_axi_rqa_awaddr(m_awaddr[16:0]), .s_axi_rqa_awvalid(m_awvalid[1]), .s_axi_rqa_awready(m_awready[1]),
+        .s_axi_rqa_wdata(m_wdata), .s_axi_rqa_wstrb(m_wstrb), .s_axi_rqa_wvalid(m_wvalid[1]), .s_axi_rqa_wready(m_wready[1]),
+        .s_axi_rqa_bresp(t_bresp[1]), .s_axi_rqa_bvalid(m_bvalid[1]), .s_axi_rqa_bready(m_bready[1]),
+        .s_axi_rqa_araddr(m_araddr[16:0]), .s_axi_rqa_arvalid(m_arvalid[1]), .s_axi_rqa_arready(m_arready[1]),
+        .s_axi_rqa_rdata(t_rdata[1]), .s_axi_rqa_rresp(t_rresp[1]), .s_axi_rqa_rvalid(m_rvalid[1]), .s_axi_rqa_rready(m_rready[1]),
+        .s_axis_samples_tdata(samp_tdata), .s_axis_samples_tvalid(samp_tvalid), .s_axis_samples_tready(samp_tready),
+        .s_axis_samples_tlast(samp_tlast),
+        .pm_awaddr(m_awaddr[5:0]), .pm_awvalid(m_awvalid[2]), .pm_awready(m_awready[2]),
+        .pm_wdata(m_wdata), .pm_wstrb(m_wstrb), .pm_wvalid(m_wvalid[2]), .pm_wready(m_wready[2]),
+        .pm_bresp(t_bresp[2]), .pm_bvalid(m_bvalid[2]), .pm_bready(m_bready[2]),
+        .pm_araddr(m_araddr[5:0]), .pm_arvalid(m_arvalid[2]), .pm_arready(m_arready[2]),
+        .pm_rdata(t_rdata[2]), .pm_rresp(t_rresp[2]), .pm_rvalid(m_rvalid[2]), .pm_rready(m_rready[2]));
+endmodule

@@ -1,0 +1,886 @@
+// RQA_extractor_nobitmap.v
+// - Streaming RQA online core (no bitmap).
+// - With DET/LAM histograms (optional), implemented as atomic read-modify-write FSMs.
+// - External histogram read is only accepted when both RMW FSMs are idle (hist_ready=1).
+
+module RQA_extractor_nobitmap #(
+    parameter integer N_MAX       = 8192,
+    parameter integer N_BITS      = 14,   // ceil(log2(N_MAX))
+    parameter integer RUNW        = 16,   // run-length counter width
+    parameter integer ENABLE_HIST = 1,    // 1: enable histograms
+    parameter integer HIST_W      = 14,   // logical histogram counter width (stored in 32-bit RAM)
+    parameter integer HIST_K      = 8192    // buckets 1..HIST_K-1 (HIST_K-1 means ">= HIST_K-1")
+)(
+    input  wire                         clk,
+    input  wire                         rst_n,
+
+    // Frame control
+    input  wire                         frame_start,
+    input  wire [31:0]                  cells_target,    // total cells to accept before finalization
+
+    // Cell stream: {i, j, flag}
+    input  wire [2*N_BITS:0]            s_axis_tdata,
+    input  wire                         s_axis_tvalid,
+    output wire                         s_axis_tready,
+
+    // Runtime actual N (number of loaded vectors): bounds the finalization sweeps
+    input  wire [31:0]                  n_actual,
+
+    // Aggregated metrics
+    output reg  [63:0]                  rr_count,
+
+    output reg  [63:0]                  det_points,
+    output reg  [31:0]                  det_lines,
+    output reg  [RUNW-1:0]              l_max,
+
+    output reg  [63:0]                  lam_points,
+    output reg  [31:0]                  lam_lines,
+    output reg  [RUNW-1:0]              v_max,
+
+    output reg                          metrics_valid,   // 1-cycle pulse
+
+    // Histogram read port (usually driven by AXI-Lite wrapper)
+    input  wire                         hist_rd_en,
+    input  wire                         hist_sel,        // 0 = DET, 1 = LAM
+    input  wire [$clog2(HIST_K)-1:0]    hist_idx,
+    output wire [31:0]                  hist_rd_data,
+
+    // Histogram readiness for external reads (both RMW FSMs idle)
+    output wire                         hist_ready,
+
+    // Minimum run-length thresholds (runtime configurable)
+    input  wire [31:0]                  l_min,           // for DET (diagonals)
+    input  wire [31:0]                  v_min,           // for LAM (verticals)
+
+    // Debug
+    output wire [31:0]                  cells_accepted_dbg
+);
+    // ------------------------------------------------------------------------
+    // Constants and field packing
+    // ------------------------------------------------------------------------
+    localparam integer IW        = N_BITS;
+    localparam integer DIAG_BIAS = N_MAX - 1;
+    localparam integer KDIM      = 2*N_MAX - 1;
+    localparam integer KDIM_SUB  = KDIM - 1;
+
+    localparam integer AW_J      = (N_MAX <= 1) ? 1 : $clog2(N_MAX);
+    localparam integer AW_K      = (KDIM  <= 1) ? 1 : $clog2(KDIM);
+    
+    // Packed state = {frame_id[1], open[1], last[iw], run[runw]}
+    localparam integer STATEW    = 1 + 1 + IW + RUNW;
+    localparam integer WEW       = (STATEW + 7)/8; // byte enables
+
+    // Finite State Machine (main phases)
+    localparam [2:0] ST_RUN        = 3'd0;
+    localparam [2:0] ST_FINAL_LAM  = 3'd1;
+    localparam [2:0] ST_FINAL_DIAG = 3'd2;
+    localparam [2:0] ST_HIST_CLR   = 3'd3;
+
+    reg [2:0] st_main;
+
+    // Unpack incoming cell
+    wire [IW-1:0] in_i  = s_axis_tdata[2*IW : IW+1];
+    wire [IW-1:0] in_j  = s_axis_tdata[IW   : 1];
+    wire          in_f  = s_axis_tdata[0];
+
+    // Upper triangle (strict) �� contribute to DET
+    wire det_use_now = (in_i < in_j);
+
+    // Diagonal address helper: k = (i - j) + (N_MAX - 1)
+    wire [AW_K-1:0] k_addr_stream = (in_i >= in_j) ?
+                                    ( (in_i - in_j) + DIAG_BIAS[AW_K-1:0] ) :
+                                    ( DIAG_BIAS[AW_K-1:0] - (in_j - in_i) );
+
+    // Frame management
+    reg cur_frame_id;       // toggles each frame to invalidate old entries
+    reg finalized_once;     // guard against double-finalization
+
+    // Cell acceptance counter
+    reg [31:0] cells_accepted;
+    assign cells_accepted_dbg = cells_accepted;
+
+    // ------------------------------------------------------------------------
+    // XPM true dual-port RAMs for LAM/DET state (Port A = WRITE, Port B = READ)
+    // ------------------------------------------------------------------------
+    // LAM RAM
+    reg  [AW_J-1:0]   lam_raddr_b, lam_waddr_a;
+    wire [STATEW-1:0] lam_rdata_b;
+    reg  [STATEW-1:0] lam_wdata_a;
+    reg               lam_we_b1;
+
+    // DET RAM
+    reg  [AW_K-1:0]   det_raddr_b, det_waddr_a;
+    wire [STATEW-1:0] det_rdata_b;
+    reg  [STATEW-1:0] det_wdata_a;
+    reg               det_we_b1;
+
+    // === LAM state RAM ===
+    tdp_bram_fw #(
+      .W (STATEW),
+      .AW(AW_J)
+    ) u_lam (
+      .clk   (clk),
+      .wea   (lam_we_b1),
+      .addra (lam_waddr_a),
+      .dina  (lam_wdata_a),
+      .douta (),
+      .web   (1'b0),
+      .addrb (lam_raddr_b),
+      .dinb  ({STATEW{1'b0}}),
+      .doutb (lam_rdata_b)
+    );
+    
+    // === DET state RAM ===
+    tdp_bram_fw #(
+      .W (STATEW),
+      .AW(AW_K)
+    ) u_det (
+      .clk   (clk),
+      .wea   (det_we_b1),
+      .addra (det_waddr_a),
+      .dina  (det_wdata_a),
+      .douta (),
+      .web   (1'b0),
+      .addrb (det_raddr_b),
+      .dinb  ({STATEW{1'b0}}),
+      .doutb (det_rdata_b)
+    );
+
+    // Pack/unpack helpers
+    function [STATEW-1:0] pack_state;
+        input              fid, open;
+        input [IW-1:0]     last;
+        input [RUNW-1:0]   run;
+        begin
+            pack_state = {fid, open, last, run};
+        end
+    endfunction
+    function get_fid;  input [STATEW-1:0] s; begin get_fid  = s[STATEW-1];           end endfunction
+    function get_open; input [STATEW-1:0] s; begin get_open = s[STATEW-2];           end endfunction
+    function [IW-1:0]   get_last; input [STATEW-1:0] s; begin get_last = s[RUNW+IW-1:RUNW]; end endfunction
+    function [RUNW-1:0] get_run;  input [STATEW-1:0] s; begin get_run  = s[RUNW-1:0]; end endfunction
+
+    // ------------------------------------------------------------------------
+    // Optional histograms (two SDPRAMs). Store 32-bit words.
+    // ------------------------------------------------------------------------
+    localparam integer AW_H      = (HIST_K <= 1) ? 1 : $clog2(HIST_K);
+    localparam integer HIST_MEMW = 32;
+
+    reg                    hdet_we_a;
+    reg  [AW_H-1:0]        hdet_waddr_a, hdet_raddr_b;
+    reg  [HIST_MEMW-1:0]   hdet_wdata_a;
+    wire [HIST_MEMW-1:0]   hdet_rdata_b;
+
+    reg                    hlam_we_a;
+    reg  [AW_H-1:0]        hlam_waddr_a, hlam_raddr_b;
+    reg  [HIST_MEMW-1:0]   hlam_wdata_a;
+    wire [HIST_MEMW-1:0]   hlam_rdata_b;
+    
+    reg  [AW_H-1:0] hdet_raddr_b_fsm, hdet_raddr_b_mux;
+    reg  [AW_H-1:0] hlam_raddr_b_fsm, hlam_raddr_b_mux;
+generate if (ENABLE_HIST) begin : GEN_HIST
+    // You can replace xpm_memory_sdpram with your own vendor-agnostic wrapper if needed.
+    xpm_memory_sdpram #(
+      .MEMORY_SIZE        (HIST_K*HIST_MEMW),   // bits
+      .MEMORY_PRIMITIVE   ("block"),
+      .CLOCKING_MODE      ("common_clock"),
+      .WRITE_DATA_WIDTH_A (HIST_MEMW),
+      .BYTE_WRITE_WIDTH_A (8),
+      .ADDR_WIDTH_A       (AW_H),
+      .READ_DATA_WIDTH_B  (HIST_MEMW),
+      .ADDR_WIDTH_B       (AW_H),
+      .READ_LATENCY_B     (1),
+      .ECC_MODE           ("no_ecc")
+    ) u_hist_det (
+      .clka (clk), .ena(1'b1),
+      .wea  ({(HIST_MEMW/8){hdet_we_a}}),
+      .addra(hdet_waddr_a), .dina(hdet_wdata_a),
+      .clkb (clk), .enb(1'b1),
+      .addrb(hdet_raddr_b_mux), .doutb(hdet_rdata_b),
+      .sleep(1'b0), .regceb(1'b1),
+      .injectsbiterra(1'b0), .injectdbiterra(1'b0),
+      .sbiterrb(), .dbiterrb()
+    );
+
+    xpm_memory_sdpram #(
+      .MEMORY_SIZE        (HIST_K*HIST_MEMW),   // bits
+      .MEMORY_PRIMITIVE   ("block"),
+      .CLOCKING_MODE      ("common_clock"),
+      .WRITE_DATA_WIDTH_A (HIST_MEMW),
+      .BYTE_WRITE_WIDTH_A (8),
+      .ADDR_WIDTH_A       (AW_H),
+      .READ_DATA_WIDTH_B  (HIST_MEMW),
+      .ADDR_WIDTH_B       (AW_H),
+      .READ_LATENCY_B     (1),
+      .ECC_MODE           ("no_ecc")
+    ) u_hist_lam (
+      .clka (clk), .ena(1'b1),
+      .wea  ({(HIST_MEMW/8){hlam_we_a}}),
+      .addra(hlam_waddr_a), .dina(hlam_wdata_a),
+      .clkb (clk), .enb(1'b1),
+      .addrb(hlam_raddr_b_mux), .doutb(hlam_rdata_b),
+      .sleep(1'b0), .regceb(1'b1),
+      .injectsbiterra(1'b0), .injectdbiterra(1'b0),
+      .sbiterrb(), .dbiterrb()
+    );
+end else begin : NO_HIST
+    always @(*) begin
+        hdet_we_a    = 1'b0; hdet_waddr_a = {AW_H{1'b0}}; hdet_wdata_a = {HIST_MEMW{1'b0}}; hdet_raddr_b_mux = {AW_H{1'b0}};
+        hlam_we_a    = 1'b0; hlam_waddr_a = {AW_H{1'b0}}; hlam_wdata_a = {HIST_MEMW{1'b0}}; hlam_raddr_b_mux = {AW_H{1'b0}};
+    end
+    assign hdet_rdata_b = {HIST_MEMW{1'b0}};
+    assign hlam_rdata_b = {HIST_MEMW{1'b0}};
+end endgenerate
+
+    // -------------------- Histogram RMW FSMs --------------------
+    localparam [1:0] HST_IDLE=2'd0, HST_ISSUE=2'd1, HST_READ=2'd2, HST_WRITE=2'd3;
+
+    // DET RMW
+    reg [1:0]           det_hst_st;
+    reg [AW_H-1:0]      det_idx_hold;
+    reg [HIST_MEMW-1:0] det_data_hold;
+
+    // LAM RMW
+    reg [1:0]           lam_hst_st;
+    reg [AW_H-1:0]      lam_idx_hold;
+    reg [HIST_MEMW-1:0] lam_data_hold;
+    
+    // DET 
+    reg                 det_q0_v, det_q1_v;
+    reg [AW_H-1:0]      det_q0_idx, det_q1_idx;
+    reg [31:0]          det_q_overflow;  
+    
+    // LAM 
+    reg                 lam_q0_v, lam_q1_v;
+    reg [AW_H-1:0]      lam_q0_idx, lam_q1_idx;
+    reg [31:0]          lam_q_overflow;  
+    
+    // hist_ready: both FSMs idle
+    wire hst_idle_all = (det_hst_st==HST_IDLE) && (lam_hst_st==HST_IDLE);
+    wire q_empty_all  = (!det_q0_v && !det_q1_v && !lam_q0_v && !lam_q1_v);
+    assign hist_ready = hst_idle_all && q_empty_all;
+
+    // External histogram read acceptance (only when both FSMs idle)
+    wire hist_accept_det = hist_rd_en && (hist_sel==1'b0) && hst_idle_all && (ENABLE_HIST!=0);
+    wire hist_accept_lam = hist_rd_en && (hist_sel==1'b1) && hst_idle_all && (ENABLE_HIST!=0);
+    wire hist_accept     = hist_accept_det | hist_accept_lam;
+    
+    wire ext_rd_det = (ENABLE_HIST!=0) && hist_rd_en && hist_ready && (hist_sel==1'b0);
+    wire ext_rd_lam = (ENABLE_HIST!=0) && hist_rd_en && hist_ready && (hist_sel==1'b1);
+    wire ext_rd_any = ext_rd_det | ext_rd_lam;
+    // 
+    always @(*) begin
+      hdet_raddr_b_mux = ext_rd_det ? hist_idx : hdet_raddr_b_fsm;
+      hlam_raddr_b_mux = ext_rd_lam ? hist_idx : hlam_raddr_b_fsm;
+    end
+    
+    reg hist_sel_q;
+    always @(posedge clk or negedge rst_n) begin
+      if (!rst_n) begin
+        hist_sel_q <= 1'b0;
+      end else if (ext_rd_any) begin
+        hist_sel_q <= hist_sel;
+      end
+    end
+    
+    assign hist_rd_data = hist_sel_q ? hlam_rdata_b : hdet_rdata_b;
+    // Bucket mapping
+    function [AW_H-1:0] hist_idx_of_len;
+        input [RUNW-1:0] len;
+        reg   [RUNW-1:0] c;
+        begin
+            c = (len < HIST_K) ? len : (HIST_K-1);
+            hist_idx_of_len = c[AW_H-1:0];
+        end
+    endfunction
+    
+ 
+    // RUN pipeline and finalization
+    // ------------------------------------------------------------------------
+    reg [IW-1:0]    i_q, j_q;  reg [AW_K-1:0] k_q; reg f_q;
+    reg [IW-1:0]    i_d, j_d;  reg [AW_K-1:0] k_d; reg f_d;
+    reg             had_read_q, had_read_d;
+
+    // Sweep helpers
+    reg [AW_J-1:0] finalize_j, finalize_j_prev;
+    reg [AW_K-1:0] finalize_k, finalize_k_prev;
+
+    reg [AW_J-1:0] n_j_last;
+    reg [AW_K-1:0] n_k_last;
+    reg [31:0]     tmp_n;
+    reg [31:0]     ktmp;
+
+    reg [1:0]      hist_clr_phase; // 0: DET, 1: LAM, 2: done
+    reg [15:0]     hist_clr_idx;
+
+    // RMW unpack temps
+    reg            lam_fid, lam_opn; reg [IW-1:0]   lam_last; reg [RUNW-1:0] lam_run;
+    reg            det_fid, det_opn; reg [IW-1:0]   det_last; reg [RUNW-1:0] det_run;
+    reg            lam_f_eff; // effective LAM flag: 0 on LOI (i==j)
+
+    // Finalization control
+    reg            finalize_req;
+    reg            final_lam_valid, final_lam_tail;
+    reg            final_det_valid, final_det_tail;
+    reg            final_det_stage;
+    reg [AW_K-1:0] k_issue;
+    reg [AW_K-1:0] k_first, k_last;
+
+    // Helpers for k_first/k_last calculation
+    wire [AW_K:0]  n1     = (n_actual > 0) ? (n_actual - 1) : {AW_K+1{1'b0}};
+    wire [AW_K:0]  tmp_hi = {1'b0, DIAG_BIAS[AW_K-1:0]} + n1;
+
+    assign s_axis_tready = (st_main == ST_RUN);
+
+    localparam integer DET_READ_LAT = 2;
+    localparam [1:0]   DET_P = 2'd0, DET_R = 2'd1, DET_W = 2'd2;
+    reg [1:0]          det_lat_cnt;
+    reg [1:0]          final_det_3st;
+
+    reg det_use_q, det_use_d;
+    reg [AW_K-1:0] k_start_final, k_end_final;
+    
+    
+     // ���� bin
+    wire [AW_H-1:0] det_bin = hist_idx_of_len(det_run);
+    
+    task automatic det_enqueue(input [AW_H-1:0] idx);
+    begin
+      if (!det_q0_v) begin
+        det_q0_v   <= 1'b1;
+        det_q0_idx <= idx;
+      end else if (!det_q1_v) begin
+        det_q1_v   <= 1'b1;
+        det_q1_idx <= idx;
+      end else begin     
+        det_q1_v   <= 1'b1;
+        det_q1_idx <= idx;
+      end
+    end
+    endtask
+
+    wire [AW_H-1:0] lam_bin = hist_idx_of_len(lam_run);
+    
+    localparam integer ADDW = 14;
+    reg [ADDW-1:0]    lam_q0_add, lam_q1_add;
+
+    reg [ADDW-1:0]    lam_add_hold;
+    function [ADDW-1:0] addw_sat_inc;
+      input [ADDW-1:0] a;
+      begin
+        addw_sat_inc = (&a) ? a : (a + {{(ADDW-1){1'b0}},1'b1});
+      end
+    endfunction
+    
+    task automatic lam_enqueue(input [AW_H-1:0] idx);
+    begin
+      if (lam_q0_v && lam_q0_idx==idx) begin
+        lam_q0_add <= addw_sat_inc(lam_q0_add);
+      end
+      else if (lam_q1_v && lam_q1_idx==idx) begin
+        lam_q1_add <= addw_sat_inc(lam_q1_add);
+      end
+      else if (!lam_q0_v) begin
+        lam_q0_v   <= 1'b1;
+        lam_q0_idx <= idx;
+        lam_q0_add <= {{(ADDW-1){1'b0}},1'b1};
+      end
+      else if (!lam_q1_v) begin
+        lam_q1_v   <= 1'b1;
+        lam_q1_idx <= idx;
+        lam_q1_add <= {{(ADDW-1){1'b0}},1'b1};
+      end
+      else begin
+        lam_q0_add <= addw_sat_inc(lam_q0_add);
+      end
+    end
+    endtask
+
+    wire [HIST_W:0] sum_w = {1'b0, lam_data_hold[HIST_W-1:0]} +
+            {{(HIST_W-ADDW+1>0?HIST_W-ADDW+1:0){1'b0}}, lam_add_hold[ (ADDW>HIST_W?HIST_W:ADDW)-1:0 ]};
+    
+
+    // ------------------------------------------------------------------------
+    // Main sequential
+    // ------------------------------------------------------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            // State RAM I/F
+            lam_raddr_b <= {AW_J{1'b0}}; det_raddr_b <= {AW_K{1'b0}};
+            lam_waddr_a <= {AW_J{1'b0}}; det_waddr_a <= {AW_K{1'b0}};
+            lam_wdata_a <= {STATEW{1'b0}}; det_wdata_a <= {STATEW{1'b0}};
+            lam_we_b1   <= 1'b0; det_we_b1 <= 1'b0;
+
+            // Metrics
+            rr_count<=0; lam_points<=0; lam_lines<=0; v_max<=0;
+            det_points<=0; det_lines<=0; l_max<=0;
+            cells_accepted<=0; metrics_valid<=1'b0;
+
+            cur_frame_id<=1'b0; finalized_once<=1'b0;
+            st_main<=ST_RUN;
+
+            // Hist RAM I/F
+            //hdet_raddr_b <= {AW_H{1'b0}}; hlam_raddr_b <= {AW_H{1'b0}};
+            hdet_raddr_b_fsm <= {AW_H{1'b0}};
+            //hdet_raddr_b_mux <= {AW_H{1'b0}};
+            hlam_raddr_b_fsm <= {AW_H{1'b0}};
+            //hlam_raddr_b_mux <= {AW_H{1'b0}};
+            hdet_waddr_a <= {AW_H{1'b0}}; hdet_wdata_a <= {HIST_MEMW{1'b0}}; hdet_we_a<=1'b0;
+            hlam_waddr_a <= {AW_H{1'b0}}; hlam_wdata_a <= {HIST_MEMW{1'b0}}; hlam_we_a<=1'b0;
+
+            // RUN pipe
+            i_q<=0; j_q<=0; k_q<=0; f_q<=1'b0; i_d<=0; j_d<=0; k_d<=0; f_d<=1'b0;
+            had_read_q<=1'b0; had_read_d<=1'b0;
+            det_use_q<=1'b0; det_use_d<=1'b0;
+
+            // Finalize
+            finalize_j<=0; finalize_k<=0; finalize_j_prev<=0; finalize_k_prev<=0;
+            n_j_last<=0; n_k_last<=0; tmp_n<=0; ktmp<=0;
+            hist_clr_phase<=0; hist_clr_idx<=0;
+            finalize_req<=1'b0;
+            final_lam_valid<=1'b0; final_lam_tail<=1'b0;
+            final_det_valid<=1'b0; final_det_tail<=1'b0;
+            final_det_stage<=1'b0; k_issue<=0; k_first<=0; k_last<=0;
+            det_lat_cnt<=0; final_det_3st<=DET_P;
+
+            // Hist FSMs & pending
+            det_hst_st<=HST_IDLE; det_idx_hold<=0; det_data_hold<=0; 
+            lam_hst_st<=HST_IDLE; lam_idx_hold<=0; lam_data_hold<=0; 
+            det_q0_v <= 1'b0; det_q1_v <= 1'b0; det_q_overflow <= 32'd0;
+            lam_q0_v <= 1'b0; lam_q1_v <= 1'b0; lam_q_overflow <= 32'd0;
+            
+            lam_q0_add <= {ADDW{1'b0}};
+            lam_q1_add <= {ADDW{1'b0}};
+
+            lam_add_hold <= {ADDW{1'b0}};
+
+        end else begin
+            // defaults
+            metrics_valid <= 1'b0;
+            lam_we_b1<=1'b0; det_we_b1<=1'b0;
+            hdet_we_a<=1'b0; hlam_we_a<=1'b0;
+
+            // New frame init
+            if (frame_start) begin
+                finalize_req   <= 1'b0;
+                had_read_q     <= 1'b0;
+                had_read_d     <= 1'b0;
+
+                if (DIAG_BIAS[AW_K-1:0] >= n1[AW_K-1:0])
+                    k_first <= DIAG_BIAS[AW_K-1:0] - n1[AW_K-1:0];
+                else
+                    k_first <= {AW_K{1'b0}};
+
+                if (tmp_hi > KDIM_SUB) k_last <= KDIM_SUB[AW_K-1:0];
+                else                   k_last <= tmp_hi[AW_K-1:0];
+
+                tmp_n = (n_actual > N_MAX) ? N_MAX[31:0] : n_actual;
+
+                if (tmp_n == 32'd0) begin
+                    n_j_last = {AW_J{1'b0}};
+                    ktmp     = 32'd0;
+                end else begin
+                    n_j_last = (tmp_n - 32'd1);
+                    if (tmp_n <= 32'd1) ktmp = 32'd0;
+                    else begin
+                        ktmp = (tmp_n << 1) - 32'd2; // 2*N-2
+                        if (ktmp > (KDIM - 1)) ktmp = (KDIM - 1);
+                    end
+                end
+
+                cur_frame_id   <= ~cur_frame_id;
+                rr_count       <= 64'd0;
+                lam_points     <= 64'd0;
+                lam_lines      <= 32'd0;
+                v_max          <= {RUNW{1'b0}};
+                det_points     <= 64'd0;
+                det_lines      <= 32'd0;
+                l_max          <= {RUNW{1'b0}};
+                cells_accepted <= 32'd0;
+                finalized_once <= 1'b0;
+
+                st_main        <= (ENABLE_HIST != 0) ? ST_HIST_CLR : ST_RUN;
+                hist_clr_phase <= 2'd0;
+                hist_clr_idx   <= 16'd0;
+
+                n_j_last <= n_j_last[AW_J-1:0];
+                n_k_last <= ktmp[AW_K-1:0];
+                det_q0_v <= 1'b0; det_q1_v <= 1'b0; det_q_overflow <= 32'd0;
+                lam_q0_v <= 1'b0; lam_q1_v <= 1'b0; lam_q_overflow <= 32'd0;
+                det_hst_st <= HST_IDLE; lam_hst_st <= HST_IDLE; // reset RMW FSMs on new frame
+            end
+
+            // ====================== Main FSM =======================
+            case (st_main)
+            // -----------------------------------------------------
+            // ST_RUN
+            // -----------------------------------------------------
+            ST_RUN: begin
+                // pipeline advance
+                had_read_d <= had_read_q;
+                if (had_read_q) begin
+                    i_d <= i_q; j_d <= j_q; k_d <= k_q; f_d <= f_q;
+                    det_use_d <= det_use_q;
+                end
+                had_read_q <= 1'b0;
+
+                // handshake & issue RAM reads
+                if (s_axis_tvalid && s_axis_tready) begin
+                    i_q <= in_i; j_q <= in_j; k_q <= k_addr_stream; f_q <= in_f;
+                    det_use_q <= det_use_now;
+
+                    lam_raddr_b <= in_j;
+                    det_raddr_b <= k_addr_stream;
+                    had_read_q  <= 1'b1;
+
+                    cells_accepted <= cells_accepted + 1;
+                    if (in_f && (in_i != in_j)) rr_count <= rr_count + 1; // exclude LOI
+                end
+
+                // consume returns
+                if (had_read_d) begin
+                    // ----- LAM per j_d -----
+                    lam_f_eff = f_d && (i_d != j_d); // exclude LOI from vertical-line analysis
+                    lam_fid  = get_fid (lam_rdata_b);
+                    lam_opn  = get_open(lam_rdata_b);
+                    lam_last = get_last(lam_rdata_b);
+                    lam_run  = get_run (lam_rdata_b);
+                    if (lam_fid !== cur_frame_id) begin
+                        lam_opn  = 1'b0; lam_last = {IW{1'b0}}; lam_run = {RUNW{1'b0}};
+                    end
+
+                    if (lam_opn && (i_d != (lam_last + 1'b1))) begin
+                        if (lam_run >= v_min[RUNW-1:0]) begin
+                            lam_points <= lam_points + lam_run;
+                            lam_lines  <= lam_lines  + 1;
+                            if (lam_run > v_max) v_max <= lam_run;
+                            if (ENABLE_HIST!=0) begin                             
+                                lam_enqueue(hist_idx_of_len(lam_run));
+                            end
+                        end
+                        lam_opn  = 1'b0;
+                        lam_run  = {RUNW{1'b0}};
+                    end
+
+                    if (lam_f_eff) begin
+                        if (!lam_opn) begin
+                            lam_opn  = 1'b1;
+                            lam_run  = {{(RUNW-1){1'b0}},1'b1};
+                            lam_last = i_d;
+                        end else begin
+                            lam_run  = lam_run + 1'b1;
+                            lam_last = i_d;
+                        end
+                    end else begin
+                        if (lam_opn && (i_d == (lam_last + 1'b1))) begin
+                            if (lam_run >= v_min[RUNW-1:0]) begin
+                                lam_points <= lam_points + lam_run;
+                                lam_lines  <= lam_lines  + 1;
+                                if (lam_run > v_max) v_max <= lam_run;
+                                if (ENABLE_HIST!=0) begin                                 
+                                    lam_enqueue(hist_idx_of_len(lam_run));
+                                end
+                            end
+                            lam_opn = 1'b0;
+                            lam_run = {RUNW{1'b0}};
+                        end
+                    end
+
+                    lam_waddr_a <= j_d;
+                    lam_wdata_a <= pack_state(cur_frame_id, lam_opn, lam_last, lam_run);
+                    lam_we_b1   <= 1'b1;
+
+                    // ----- DET per k_d (upper triangle only) -----
+                    if (det_use_d) begin
+                        det_fid  = get_fid (det_rdata_b);
+                        det_opn  = get_open(det_rdata_b);
+                        det_last = get_last(det_rdata_b);
+                        det_run  = get_run (det_rdata_b);
+                        if (det_fid !== cur_frame_id) begin
+                            det_opn  = 1'b0; det_last = {IW{1'b0}}; det_run = {RUNW{1'b0}};
+                        end
+                        if ((det_opn == 1'b1) && (i_d != (det_last + 1'b1))) begin
+                            if (det_run >= l_min[RUNW-1:0]) begin
+                                det_points <= det_points + det_run;
+                                det_lines  <= det_lines  + 1;
+                                if (det_run > l_max) l_max <= det_run;
+                                if (ENABLE_HIST!=0) begin
+                                    det_enqueue(hist_idx_of_len(det_run));
+                                end
+                            end
+                            det_opn  = 1'b0;
+                            det_run  = {RUNW{1'b0}};
+                        end
+
+                        if (f_d) begin
+                            if (det_opn == 1'b0) begin
+                                det_opn  = 1'b1;
+                                det_run  = {{(RUNW-1){1'b0}},1'b1};
+                                det_last = i_d;
+                            end else begin
+                                if (i_d == det_last + 1'b1) begin
+                                    det_run  = det_run + 1'b1;
+                                    det_last = i_d;
+                                end
+                            end
+                        end else begin
+                            if ((det_opn===1'b1) && (i_d == (det_last + 1'b1))) begin
+                                if (det_run >= l_min[RUNW-1:0]) begin
+                                    det_points <= det_points + det_run;
+                                    det_lines  <= det_lines  + 1;
+                                    if (det_run > l_max) l_max <= det_run;
+                                    if (ENABLE_HIST!=0) begin
+                                        det_enqueue(hist_idx_of_len(det_run));
+                                    end
+                                end
+                                det_opn = 1'b0;
+                                det_run = {RUNW{1'b0}};
+                            end
+                        end
+
+                        det_waddr_a <= k_d;
+                        det_wdata_a <= pack_state(cur_frame_id, det_opn, det_last, det_run);
+                        det_we_b1   <= 1'b1;
+                    end
+                end
+
+                // finalize trigger
+                if (!finalized_once && (cells_target != 0) && (cells_accepted == cells_target)) begin
+                    if (had_read_q || had_read_d) begin
+                        finalize_req <= 1'b1;
+                    end else begin
+                        st_main         <= ST_FINAL_LAM;
+                        finalize_j      <= {AW_J{1'b0}};
+                        finalize_k      <= {AW_K{1'b0}};
+                        finalize_j_prev <= {AW_J{1'b0}};
+                        finalize_k_prev <= {AW_K{1'b0}};
+                        finalized_once  <= 1'b1;
+                        finalize_req    <= 1'b0;
+                        final_lam_valid <= 1'b0;
+                        final_lam_tail  <= 1'b0;
+                        had_read_q      <= 1'b0;
+                        had_read_d      <= 1'b0;
+                    end
+                end
+
+                if (finalize_req && !had_read_q && !had_read_d) begin
+                    st_main         <= ST_FINAL_LAM;
+                    finalize_j      <= {AW_J{1'b0}};
+                    finalize_k      <= {AW_K{1'b0}};
+                    finalize_j_prev <= {AW_J{1'b0}};
+                    finalize_k_prev <= {AW_K{1'b0}};
+                    finalized_once  <= 1'b1;
+                    finalize_req    <= 1'b0;
+                    final_lam_valid <= 1'b0;
+                    final_lam_tail  <= 1'b0;
+                    had_read_q      <= 1'b0;
+                    had_read_d      <= 1'b0;
+                end
+            end
+
+            // -----------------------------------------------------
+            // ST_FINAL_LAM
+            // -----------------------------------------------------
+            ST_FINAL_LAM: begin
+                lam_raddr_b <= finalize_j;
+
+                if (final_lam_valid) begin
+                    lam_fid = get_fid (lam_rdata_b);
+                    lam_opn = get_open(lam_rdata_b);
+                    lam_run = get_run (lam_rdata_b);
+
+                    if (lam_fid === cur_frame_id && (lam_opn === 1'b1)) begin
+                        if (lam_run >= v_min[RUNW-1:0]) begin
+                            lam_points <= lam_points + lam_run;
+                            lam_lines  <= lam_lines  + 1;
+                            if (lam_run > v_max) v_max <= lam_run;
+                            if (ENABLE_HIST!=0) begin
+                                lam_enqueue(hist_idx_of_len(lam_run));
+                            end
+                        end
+                        // clear this column
+                        lam_waddr_a <= finalize_j_prev;
+                        lam_wdata_a <= pack_state(cur_frame_id, 1'b0, {IW{1'b0}}, {RUNW{1'b0}});
+                        lam_we_b1   <= 1'b1;
+                    end
+                end
+
+                finalize_j_prev <= finalize_j;
+                final_lam_valid <= 1'b1;
+
+                if (!final_lam_tail) begin
+                    if (finalize_j == n_j_last) begin
+                        final_lam_tail <= 1'b1;
+                        k_start_final   <= DIAG_BIAS[AW_K-1:0] - (n_actual-1);
+                        k_end_final     <= DIAG_BIAS[AW_K-1:0] - 1;
+                    end else begin
+                        finalize_j <= finalize_j + 1'b1;
+                    end
+                end else if (k_start_final > k_end_final) begin
+                    // no diagonals to settle this frame
+                    metrics_valid <= 1'b1;
+                    st_main       <= ST_RUN;
+                end else begin
+                    st_main          <= ST_FINAL_DIAG;
+                    final_det_stage  <= 1'b0;
+                    final_det_valid  <= 1'b0;
+                    final_det_tail   <= 1'b0;
+                    finalize_k       <= k_start_final;
+                    finalize_k_prev  <= {AW_K{1'b0}};
+                    final_lam_tail   <= 1'b0;
+                    k_issue          <= {AW_K{1'b0}};
+                    final_det_3st    <= DET_P;
+                end
+            end
+
+            // -----------------------------------------------------
+            // ST_FINAL_DIAG
+            // -----------------------------------------------------
+            ST_FINAL_DIAG: begin
+                det_we_b1 <= 1'b0;
+
+                case (final_det_3st)
+                  DET_P: begin
+                    det_raddr_b <= finalize_k;
+                    k_issue     <= finalize_k;
+                    det_lat_cnt <= 0;
+                    if (finalize_k == k_end_final) final_det_tail <= 1'b1;
+                    else                           finalize_k    <= finalize_k + 1'b1;
+                    final_det_3st <= DET_R;
+                  end
+
+                  DET_R: begin
+                    if (det_lat_cnt == (DET_READ_LAT-1)) begin
+                        if (get_fid(det_rdata_b) == cur_frame_id &&
+                            get_open(det_rdata_b) &&
+                            (get_run(det_rdata_b) != {RUNW{1'b0}}) &&
+                            (get_run(det_rdata_b) >= l_min[RUNW-1:0])) begin
+
+                            det_points <= det_points + get_run(det_rdata_b);
+                            det_lines  <= det_lines  + 1;
+                            if (get_run(det_rdata_b) > l_max) l_max <= get_run(det_rdata_b);
+                            if (ENABLE_HIST!=0) begin
+                                det_enqueue(hist_idx_of_len(get_run(det_rdata_b)));
+                            end
+                        end
+                        final_det_3st <= DET_W;
+                    end else begin
+                        det_lat_cnt <= det_lat_cnt + 1'b1;
+                    end
+                  end
+
+                  DET_W: begin
+                    det_waddr_a <= k_issue;
+                    det_wdata_a <= pack_state(cur_frame_id, 1'b0, {IW{1'b0}}, {RUNW{1'b0}});
+                    det_we_b1   <= 1'b1;
+
+                    if (final_det_tail) begin
+                        metrics_valid  <= 1'b1;
+                        final_det_tail <= 1'b0;
+                        st_main        <= ST_RUN;
+                    end else begin
+                        final_det_3st <= DET_P;
+                    end
+                  end
+                endcase
+            end
+
+            // -----------------------------------------------------
+            // ST_HIST_CLR
+            // -----------------------------------------------------
+            ST_HIST_CLR: begin
+                if (ENABLE_HIST!=0) begin
+                    if (hist_clr_phase==2'd0) begin
+                        hdet_we_a    <= 1'b1;
+                        hdet_waddr_a <= hist_clr_idx[AW_H-1:0];
+                        hdet_wdata_a <= {HIST_MEMW{1'b0}};
+                        if (hist_clr_idx == HIST_K-1) begin
+                            hist_clr_idx <= 16'd0; hist_clr_phase <= 2'd1;
+                        end else begin
+                            hist_clr_idx <= hist_clr_idx + 1'b1;
+                        end
+                    end else if (hist_clr_phase==2'd1) begin
+                        hlam_we_a    <= 1'b1;
+                        hlam_waddr_a <= hist_clr_idx[AW_H-1:0];
+                        hlam_wdata_a <= {HIST_MEMW{1'b0}};
+                        if (hist_clr_idx == HIST_K-1) begin
+                            hist_clr_idx <= 16'd0; hist_clr_phase <= 2'd2;
+                        end else begin
+                            hist_clr_idx <= hist_clr_idx + 1'b1;
+                        end
+                    end else begin
+                        st_main <= ST_RUN;
+                    end
+                end else begin
+                    st_main <= ST_RUN;
+                end
+            end
+
+            default: st_main <= ST_RUN;
+            endcase
+
+            // =====================================================
+            // Histogram RMW FSMs + external read acceptance
+            // =====================================================
+            if (ENABLE_HIST!=0) begin              
+                case (det_hst_st)
+                  HST_IDLE: begin
+                      if (det_q0_v) begin
+                        det_idx_hold <= det_q0_idx;
+                        hdet_raddr_b_fsm <= det_q0_idx;      
+                
+                        det_q0_v   <= det_q1_v;          
+                        det_q0_idx <= det_q1_idx;
+                        det_q1_v   <= 1'b0;
+                
+                        det_hst_st <= HST_ISSUE;
+                      end
+                    end
+                  HST_ISSUE: det_hst_st <= HST_READ;     
+                  HST_READ : begin
+                    det_data_hold <= hdet_rdata_b;       
+                    det_hst_st    <= HST_WRITE;
+                  end
+                  HST_WRITE: begin
+                    hdet_we_a    <= 1'b1;
+                    hdet_waddr_a <= det_idx_hold;        
+                    hdet_wdata_a <= (&det_data_hold[HIST_W-1:0]) ? det_data_hold
+                                   : (det_data_hold + {{(HIST_MEMW-1){1'b0}},1'b1});
+                    det_hst_st   <= HST_IDLE;
+                  end
+                endcase             
+                case (lam_hst_st)
+                  HST_IDLE: begin
+                      if (lam_q0_v) begin
+                        lam_idx_hold <= lam_q0_idx;
+                        lam_add_hold <= lam_q0_add;
+                        hlam_raddr_b_fsm <= lam_q0_idx;
+                
+                        lam_q0_v   <= lam_q1_v;
+                        lam_q0_idx <= lam_q1_idx;
+                        lam_q0_add <= lam_q1_add;
+                        lam_q1_v   <= 1'b0;
+                        lam_q1_idx <= {AW_H{1'b0}};
+                        lam_q1_add <= {ADDW{1'b0}};
+                        lam_hst_st <= HST_ISSUE;
+                      end
+                    end
+                  HST_ISSUE: lam_hst_st <= HST_READ;
+                  HST_READ : begin
+                    lam_data_hold <= hlam_rdata_b;
+                    lam_hst_st    <= HST_WRITE;
+                  end
+                  HST_WRITE: begin
+                    hlam_we_a    <= 1'b1;
+                    hlam_waddr_a <= lam_idx_hold;                       
+                    hlam_wdata_a <= sum_w[HIST_W]
+                                    ? {{(HIST_MEMW-HIST_W){1'b0}}, {HIST_W{1'b1}}}
+                                    : {{(HIST_MEMW-HIST_W){1'b0}}, sum_w[HIST_W-1:0]};
+                    lam_hst_st   <= HST_IDLE;
+                  end
+                endcase
+            end
+        end
+    end
+
+endmodule

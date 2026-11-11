@@ -1,0 +1,13 @@
+﻿numpy
+scipy
+pandas
+matplotlib
+jupyterlab
+ipykernel
+numba
+openpyxl
+pytest
+cupy-cuda12x[ctk]
+nolitsa @ git+https://github.com/manu-mannattil/nolitsa.git
+ghkss       # GHKSS noise reduction (C++ drop-in for TISEAN), used by scripts/filter_all_series.py
+pyunicorn   # builds from source on Windows: needs VS Build Tools 2022 with the C++ workload and a Windows SDK

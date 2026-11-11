@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Data and generated output stay out of the repository; the scripts recreate the folders' contents
+*.mat
+*.npy
+Phase1/results/*
+!Phase1/results/csv
+!Phase1/results/figures
+Phase1/results/csv/*
+Phase1/results/figures/*
+Phase1/golden/*
+Phase1/data/*
+Phase3/reports/*
+Phase3/build/*
+!Phase3/build/hwresults
+Phase3/build/hwresults/*
+!**/.gitkeep
+
+# Vivado / Vitis binaries and logs
+Phase3/sw/*.elf
+*.xsa
+*.bit
+*.jou
+*.str
+.Xil/
+*.log
+
+# LaTeX
+*.aux
+*.out
+*.toc
+*.synctex.gz
