@@ -31,7 +31,7 @@ by the scripts. `Phase3/sw/null_tables.h`, which `build_null.ps1` needs, is also
 ## Running it
 
 1. **Python reference.** From `Phase1`: create a virtual environment, install `requirements.txt` and the package (`pip install -e .`), then run `pytest -q`.
-2. **Golden vectors.** `python scripts/export_golden.py` writes the integer test vectors into `Phase1/golden/` (large). `scripts/benchmark.py`, `scripts/quantisation_error.py` and `scripts/synthetic_validation.py` give the CPU/GPU timings and the fixed-point error.
+2. **Golden vectors.** `python scripts/export_golden.py` writes the integer test vectors into `Phase1/golden/` (large). `scripts/benchmark.py`, `scripts/quantisation_error.py` and `scripts/synthetic_validation.py` give the CPU/GPU timings and the fixed-point error. `scripts/benchmark_gpu_rqa.py` times the CuPy pipeline with the RQA extraction on the GPU (`src/jrp/rqa_gpu.py`), `scripts/gpu_power.py` measures the GPU card power, `scripts/benchmark_pyrqa.py` times PyRQA (needs `pip install pyrqa pyopencl` and an OpenCL GPU), and `scripts/cpu_gpu_fpga_figure.py` and `scripts/time_vs_n_figure.py` draw the comparison figures (frame time at N=4096 and against N, with PyRQA).
 3. **Simulation.** From `Phase3/scripts` in PowerShell: `.\run_all_scan.ps1`, `.\run_all_extract.ps1`, `.\run_all_top.ps1`, `.\sim_rt_core.ps1` (see `Phase3/README.md`).
 4. **Board builds.** `build_board.tcl` (register-driven build) and `build_rt_board.tcl` (real-time build with the DMA front end, `MAX_M` 6 or 10), run with Vivado in batch mode from `Phase3/build`. The bare-metal program is built with `sw/build.ps1`.
 5. **Board runs.** `hw_load.tcl` loads a bitstream, `run_all_hw.ps1` runs the test cases, and `hw_sw_run.tcl` runs the bare-metal program and the rate tests. Details are in `Phase3/docs/`.
@@ -41,6 +41,9 @@ by the scripts. `Phase3/sw/null_tables.h`, which `build_null.ps1` needs, is also
    `python scripts/simultaneity_test.py` (aligned against offset windows),
    `python scripts/export_filtered_pairs.py --ghkss 3,2` and `python scripts/export_window_cases.py` (golden cases for the board),
    and on the board `Phase3/scripts/run_filtered_pairs.sh` and `run_window_cases.sh` (run from `Phase3/build`), then `python scripts/collate_board_windows.py`.
+   Footstep-resolved test: `python scripts/termite_noise_test.py` (band-pass, decimation, surrogates), `python scripts/termite_footstep_regroup.py` (envelope footstep detector),
+   `python scripts/export_termite_cases.py` (60 golden cases), the same board script `run_window_cases.sh` with the names in `golden/termite_cases.txt` (strip carriage returns, for example `tr -d '\r'`), then `python scripts/collate_termite_cases.py`.
+   The wild ant is added with `python scripts/termite_noise_test_wild.py` and `python scripts/export_termite_cases.py wild` (writes `golden/termite_cases_wild.txt`); `collate_termite_cases.py` picks both up.
 
 ## Data
 
